@@ -1,0 +1,6 @@
+{
+  "name": "face-blockchain-verify",
+  "private": true,
+  "scripts": { "compile": "hardhat compile", "deploy:amoy": "hardhat run scripts/deploy.js --network amoy", "node": "hardhat node" },
+  "devDependencies": { "@nomicfoundation/hardhat-toolbox": "^5.0.0", "dotenv": "^16.4.0", "hardhat": "^2.22.0" }
+}
