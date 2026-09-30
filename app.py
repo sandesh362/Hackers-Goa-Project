@@ -1,6 +1,6 @@
 """Local browser dashboard for the face-evidence demonstration pipeline."""
 from __future__ import annotations
-import os, shutil, uuid
+import hashlib, os, uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -17,6 +17,7 @@ load_dotenv(ENV_FILE)
 app = FastAPI(title="The Acers", docs_url=None, redoc_url=None)
 app.mount("/static", StaticFiles(directory=ROOT / "static"), name="static")
 RUNS: dict[str, dict[str, Any]] = {}
+RUN_ARTIFACTS: dict[str, dict[str, Path]] = {}
 SETTINGS = ("SERPAPI_KEY", "WEB3_RPC_URL", "PRIVATE_KEY", "CONTRACT_ADDRESS", "NETWORK", "INPUT_IMAGE_URL", "SIMILARITY_THRESHOLD", "MAX_WEB_RESULTS")
 SECRET_SETTINGS = {"SERPAPI_KEY", "PRIVATE_KEY"}
 
@@ -63,26 +64,49 @@ def autoconfigure_local():
         set_key(str(ENV_FILE), key, value); os.environ[key] = value
     return {"ok": True, "address": address}
 
-def run_pipeline(run_id: str, image_path: Path, image_url: str):
+def run_pipeline(run_id: str, image_path: Path, image_url: str, original_image_path: Path | None = None):
     state = RUNS[run_id]
+    original_image_path = original_image_path or image_path
     try:
         from pipeline.face_id import extract_face, save_encoding, save_search_crop
+        from pipeline.authenticity import analyze_authenticity, analyze_quality
+        from pipeline.image_forensics import analyze_image_forensics
         from pipeline.web_search import reverse_image_search
         from pipeline.face_match import compare_candidate
-        from pipeline.blockchain import submit_record, fetch_record_hash
+        from pipeline.blockchain import submit_record, fetch_record_hash, evidence_hash
         from pipeline.verify import verify_record
         state.update(status="running", stage="Detecting one face")
-        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"); folder = OUTPUT / stamp; folder.mkdir(parents=True, exist_ok=True)
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"); folder = OUTPUT / f"{stamp}_{run_id}"; folder.mkdir(parents=True, exist_ok=True)
         face = extract_face(image_path); save_encoding(face, folder); search_crop = save_search_crop(face, folder)
-        state.update(face_detection=face.detection_method)
+        with Image.open(image_path) as uploaded:
+            image_size = uploaded.size
+        face_detected = face.encoding.size > 0
+        quality = analyze_quality(face.crop, image_size, face_detected)
+        authenticity = analyze_authenticity(face.crop, face_detected)
+        state.update(face_detection=face.detection_method, face_quality=quality, authenticity=authenticity)
+        state.update(stage="Analyzing full-image manipulation and generating explanation")
+        raw_forensics = analyze_image_forensics(original_image_path, folder)
+        artifact_paths = raw_forensics.pop("_artifact_paths", {})
+        RUN_ARTIFACTS[run_id] = {"original": original_image_path} | {key: Path(value) for key, value in artifact_paths.items()}
+        explainability = raw_forensics.setdefault("explainability", {})
+        explainability["artifacts"] = {kind: f"/api/runs/{run_id}/forensics/{kind}"
+                                        for kind in RUN_ARTIFACTS[run_id]}
+        state.update(image_forensics=raw_forensics)
         state.update(stage="Searching with a face-focused crop")
         # Send the face-focused crop to Lens so clothing/background do not dominate visual matches.
         results = reverse_image_search(image_path=search_crop)
         if not results: raise RuntimeError("No live reverse-image results were returned. No match was fabricated.")
         state.update(stage="Comparing the top candidate (advisory)")
         similarity = compare_candidate(face.encoding, results[0].get("image_url_if_available"))
-        evidence = {"face_hash": face.face_hash, "matched_url": results[0]["url"], "snippet": results[0]["snippet"], "source_domain": results[0]["source_domain"], "similarity_score": similarity.get("distance"), "timestamp": datetime.now(timezone.utc).isoformat()}
-        chain, verification = {"available": False}, {"status": "SEARCH COMPLETE"}
+        original_digest = hashlib.sha256(original_image_path.read_bytes()).hexdigest()
+        evidence = {"face_hash": face.face_hash, "image_sha256": original_digest,
+                    "face_detected": face_detected, "face_quality": quality,
+                    "authenticity": authenticity, "image_forensics": raw_forensics,
+                    "matched_url": results[0]["url"], "snippet": results[0]["snippet"],
+                    "source_domain": results[0]["source_domain"], "similarity_score": similarity.get("distance"),
+                    "timestamp": datetime.now(timezone.utc).isoformat()}
+        digest = evidence_hash(evidence)
+        chain, verification = {"available": False, "evidence_hash": digest}, {"status": "SEARCH COMPLETE"}
         blockchain_ready = all(os.getenv(key) for key in ("WEB3_RPC_URL", "PRIVATE_KEY", "CONTRACT_ADDRESS"))
         if blockchain_ready:
             state.update(stage="Anchoring evidence on-chain")
@@ -93,9 +117,13 @@ def run_pipeline(run_id: str, image_path: Path, image_url: str):
             verification = verify_record(evidence, fetch_record_hash(chain["record_id"]))
         else:
             chain["message"] = "Search results are ready. Add RPC URL, private key, and contract address in Settings to enable the optional blockchain receipt."
-        report = {"evidence": evidence, "face_detection": face.detection_method, "ranked_search_results": results, "similarity": similarity, "blockchain": chain, "verification": verification}
+        report = {"evidence": evidence, "evidence_hash": digest, "face_detected": face_detected, "face_quality": quality,
+                  "authenticity": authenticity, "image_forensics": raw_forensics,
+                  "face_detection": face.detection_method,
+                  "ranked_search_results": results, "similarity": similarity, "blockchain": chain,
+                  "verification": verification}
         report_path = folder / f"report_{stamp}.json"; report_path.write_text(__import__("json").dumps(report, indent=2))
-        state.update(status="complete", stage="Complete", report=report, report_path=str(report_path))
+        state.update(status="complete", stage="Complete", report=report, report_file=report_path.name)
     except BaseException as exc:
         state.update(status="error", stage="Stopped", error=str(exc) or exc.__class__.__name__)
 
@@ -117,9 +145,23 @@ def crop_to_selected_person(image_path: Path, focus_x: float, focus_y: float) ->
 async def start_run(background_tasks: BackgroundTasks, image: UploadFile = File(...), image_url: str = Form(""), focus_x: str = Form(""), focus_y: str = Form("")):
     if not image.filename: raise HTTPException(400, "Upload a JPG, PNG, or WEBP image.")
     if image_url and not image_url.startswith(("http://", "https://")): raise HTTPException(400, "The optional image URL must start with http:// or https://.")
+    if image.content_type not in {"image/jpeg", "image/png", "image/webp"}:
+        raise HTTPException(415, "Upload a JPG, PNG, or WEBP image.")
+    content = await image.read(500 * 1024 + 1)
+    if not content or len(content) > 500 * 1024:
+        raise HTTPException(413, "Image must be non-empty and no larger than 500 KB.")
+    try:
+        from io import BytesIO
+        with Image.open(BytesIO(content)) as check:
+            if check.format not in {"JPEG", "PNG", "WEBP"}: raise ValueError("unsupported image format")
+            check.verify()
+    except Exception as exc:
+        raise HTTPException(400, "Uploaded file is not a valid JPG, PNG, or WEBP image.") from exc
     upload_dir = OUTPUT / "uploads"; upload_dir.mkdir(parents=True, exist_ok=True)
-    suffix = Path(image.filename).suffix.lower() or ".jpg"; path = upload_dir / f"{uuid.uuid4().hex}{suffix}"
-    with path.open("wb") as destination: shutil.copyfileobj(image.file, destination)
+    suffix = {"image/jpeg": ".jpg", "image/png": ".png", "image/webp": ".webp"}[image.content_type]
+    path = upload_dir / f"{uuid.uuid4().hex}{suffix}"
+    path.write_bytes(content)
+    original_path = path
     selected = False
     if focus_x and focus_y:
         try:
@@ -129,13 +171,27 @@ async def start_run(background_tasks: BackgroundTasks, image: UploadFile = File(
         except ValueError:
             raise HTTPException(400, "The selected-person coordinates were invalid. Click the preview again.")
     run_id = uuid.uuid4().hex[:10]; RUNS[run_id] = {"id": run_id, "status": "queued", "stage": "Preparing selected person" if selected else "Preparing your evidence run", "manual_selection": selected}
-    background_tasks.add_task(run_pipeline, run_id, path, image_url)
+    background_tasks.add_task(run_pipeline, run_id, path, image_url, original_path)
     return RUNS[run_id]
 
 @app.get("/api/runs/{run_id}")
 def get_run(run_id: str):
     if run_id not in RUNS: raise HTTPException(404, "Run not found")
     return RUNS[run_id]
+
+@app.get("/api/runs/{run_id}/forensics/{kind}")
+def get_forensic_artifact(run_id: str, kind: str):
+    """Serve only artifacts registered for a completed run, never arbitrary paths."""
+    if kind not in {"original", "heatmap", "overlay"}:
+        raise HTTPException(404, "Forensic artifact not found")
+    path = RUN_ARTIFACTS.get(run_id, {}).get(kind)
+    if not path or not path.is_file():
+        raise HTTPException(404, "Forensic artifact not available")
+    media_type = "image/png" if kind in {"heatmap", "overlay"} else "application/octet-stream"
+    if kind == "original":
+        media_type = {".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png", ".webp": "image/webp"}.get(path.suffix.lower(), "application/octet-stream")
+    return FileResponse(path, media_type=media_type)
+
 
 @app.post("/api/runs/{run_id}/tamper")
 def tamper_check(run_id: str):

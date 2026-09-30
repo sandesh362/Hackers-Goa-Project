@@ -1,0 +1,6 @@
+# Optional local face authenticity inference (CPU PyTorch build).
+# Install base requirements first, then this file to enable actual pretrained-model inference.
+# Model weights are downloaded and cached on first inference from Hugging Face.
+-r requirements.txt
+torch>=2.2.0
+transformers>=4.40.0

@@ -248,6 +248,57 @@ Then run the pipeline using the configured Amoy network.
 8. Scroll to the blockchain verification section.
 9. Verify the evidence status.
 
+## AI Face Authenticity Detection
+
+The existing dlib face crop is classified by the optional pretrained model described below. The selected Hugging Face model is `prithivMLmods/Deep-Fake-Detector-v2-Model`, a fine-tuned ViT-base patch-16 classifier (about 85.8 million parameters per its model card), used through Transformers and PyTorch. Its image processor converts RGB input to 224×224 and its classes are documented as Realism and Deepfake. The implementation pins Hugging Face commit `3a99ae26f52c7ac7c3a53103b6cf3a8b617f7093` for repeatable model loading. It is a demonstration classifier, not a forensic-grade or independently validated detector.
+
+Install the optional ML stack (base requirements are included):
+
+```bash
+python -m pip install -r requirements-ml.txt
+```
+
+The model loads lazily once and uses CUDA when available, otherwise CPU. First inference downloads/caches the model from Hugging Face. If optional dependencies, model access, inference or class interpretation fail, the existing search pipeline continues and records analysis as unavailable. Face crops smaller than 64 pixels on either side are skipped.
+
+A deterministic quality heuristic (face crop dimensions, face-to-image area, Laplacian sharpness, exposure and contrast) produces a 0–100 score; it is not a trained quality model. Class scores are normalized over the model's real/manipulated labels and are not calibrated objective probabilities. Display bands are ≤0.35 for “likely authentic,” ≥0.65 for “potentially manipulated,” and otherwise “inconclusive.” These are cautious UI thresholds, not validated guarantees. False positives, false negatives and domain shift are expected, especially for compression, edits and unfamiliar generators.
+
+## AI Image Forensics
+
+The same classifier analyzes the full RGB uploaded image as a separate assessment in addition to the face crop. Deterministic preprocessing delegates resizing and normalization to the model's image processor. The result includes `classification`, `manipulation_score`, `authenticity_score`, model metadata and thresholds. It assesses the model's learned Realism/Deepfake classes; it does not independently detect or localize every kind of splicing, copy-move edit, compression boundary or manipulation.
+
+## Explainable AI
+
+The selected architecture is a Vision Transformer, so a CNN Grad-CAM convolutional target layer is not appropriate. The project uses **Integrated Gradients**: gradients of the manipulated-class score are accumulated over a fixed 16-step path from the zero baseline in processor-normalized input space to the preprocessed image. Positive attribution is resized to the original dimensions and saved as a heatmap and blended overlay. These indicate regions influencing the model prediction; they are not a pixel-level mask or confirmed altered pixels. If explanation generation fails, the classification remains reportable.
+
+The dashboard displays the original, heatmap and overlay. Files use the existing run output storage and are served only through a run-scoped API route. Their SHA-256 digests and safe API references are included in the evidence; image data is not stored on-chain.
+
+## Updated Architecture
+
+```text
+Input → face detection/crop → quality + face authenticity
+      → full-image manipulation classification → Integrated Gradients
+      → face embedding comparison → Google Lens visual search
+      → evidence JSON + visualization hashes → canonical SHA-256 → blockchain
+```
+
+The face result, full-image forensic result, thresholds, model metadata, explanation method/target, artifact hashes/references and existing search evidence enter canonical evidence JSON before hashing. Changing a forensic score or explanation field changes the digest anchored by the existing contract. The `/api/runs/{id}` response includes `report.image_forensics`; these fields are also inside `report.evidence`. Example:
+
+```json
+{
+  "image_forensics": {
+    "classification": "inconclusive",
+    "manipulation_score": 0.51,
+    "authenticity_score": 0.49,
+    "explainability": {
+      "method": "Integrated Gradients",
+      "heatmap_available": true,
+      "overlay_available": true
+    }
+  },
+  "evidence_hash": "SHA-256 of canonical evidence"
+}
+```
+
 ## Face Embedding Comparison
 
 When a usable candidate face is available, the application can calculate an advisory face-embedding distance using `face_recognition` / dlib.
